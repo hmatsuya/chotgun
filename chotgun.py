@@ -9,6 +9,7 @@ from paramiko.client import SSHClient
 import re
 import time
 import select
+import fcntl
 
 class USIEngine:
     def __init__(self, name, host, engine_path,
@@ -17,7 +18,6 @@ class USIEngine:
         self.name = name
         self.nodes=nodes
         self.multiPV = multiPV
-        self.bestmove = None
         self.quit_event = threading.Event()
 
         self.client = SSHClient()
@@ -26,7 +26,7 @@ class USIEngine:
         dirname = os.path.dirname(engine_path)
         command = f'cd {dirname} && {engine_path}'
         self.stdin, self.stdout, self.stderr = \
-                self.client.exec_command(command)
+                self.client.exec_command(command, bufsize=0)
 
         self.queue = queue.Queue()
         self.watcher_thread = threading.Thread(target=self.stream_watcher,
@@ -56,6 +56,7 @@ class USIEngine:
             line = stream.readline().strip()
             if len(line):
                 logging.debug(f'{self.name} > {line}')
+                print(f'info string {self.name} > {line}', flush=True)
                 match = prog.match(line)
                 if match:
                     logging.debug(f'match: {match.group(1, 2, 3)}')
@@ -68,12 +69,12 @@ class USIEngine:
                     logging.debug(f'{self.name}: Found score of pv {num}')
                     self.pvs[num] = [int(match.group(1)), match.group(3)]
 
-                # TODO: bestmove
+                # bestmove
                 if line.startswith('bestmove'):
-                    self.bestmove = line[9:].split()[0].strip()
+                    self.status = 'wait'
 
                 self.queue.put(line)
-        logging.debug(f'{self.name}: terminating the watcher thread')
+        logging.debug(f'{self.name}: terminating the engine watcher thread')
 
     def set_option(self, name, value):
         self.send(f'setoption name {name} value {value}')
@@ -82,13 +83,18 @@ class USIEngine:
         self.terminate()
 
     def terminate(self):
-        self.send('quit')
+        if self.status in ['go', 'ponder']:
+            self.send('stop')
+            self.wait_for_bestmove()
         self.quit_event.set()
         self.watcher_thread.join(1)
+        self.send('quit')
+        self.status = 'quit'
         #self.client.close()
 
     def send(self, command):
         logging.debug(f'sending {command} to {self.name}')
+        print(f'info string sending {command} to {self.name}', flush=True)
         self.stdin.write((command + '\n').encode('utf-8'))
         self.stdin.flush()
 
@@ -100,60 +106,116 @@ class USIEngine:
             lines += f'{line}\n'
             if (line == command):
                 logging.debug(f'{self.name}: found {command}')
+                self.status = 'wait'
                 return lines
 
     def wait_for_bestmove(self):
         logging.debug(f'{self.name}: waiting for bestmove...')
+        infostr(f'{self.name}: waiting for bestmove...')
         while self.client.get_transport().is_active():
             line = self.queue.get()
             if (line.startswith('bestmove')):
                 logging.debug(f'{self.name}: found bestmove')
+                infostr(f'{self.name}: found bestmove')
                 bestmove = line[9:].split()[0].strip()
-                self.bestmove = bestmove
+                self.status = 'wait'
                 return  bestmove
 
     def set_position(self, pos):
-        logging.debug('in set_position()')
-        self.pos = pos
+        self.position = pos
         self.send(f'position {pos}')
+
+    def clear_queue(self):
+        while True:
+            try:
+                line = self.queue.get_nowait()
+                print(f'info string {self.name}: clearing queue: {line}', flush=True)
+            except queue.Empty:
+                break
+
+    def ponder(self, command):
+        infostr(f'{self.name}: in ponder()')
+        self.go_command = command
+        if 'ponder' not in command:
+            command = command.replace('go', 'go ponder')
+        self.send(command)
+        self.status = 'ponder'
+        infostr(f'{self.name}: end of ponder()')
+
+    def stop(self):
+        infostr(f'{self.name}: in stop()')
+        if self.status in ['go', 'ponder']:
+            self.send('stop')
+            self.wait_for_bestmove()
+            self.status = 'wait'
+
 
 class Chotgun:
     def __init__(self, n_jobs=5):
         logging.basicConfig(level=logging.DEBUG)
         engine_path = '/home/hmatsuya/workspace/Shogi/test/yane1/exe/YaneuraOu-by-gcc'
-        self.n_jobs = 5
+        self.n_jobs = n_jobs
         self.head = None
         self.status = 'wait'
-        self.bestmove = None
         self.engines = []
         self.position = 'startpos'
         self.go_command = None
         for i in range(n_jobs):
             self.engines.append(USIEngine(f'yane{i}', 'localhost', engine_path, multiPV=1))
 
+        # setup command watcher thread
+        logging.debug('setting up command watcher')
+        self.quit_event = threading.Event()
+        self.queue = queue.Queue()
+        self.watcher_thread = threading.Thread(target=self.command_watcher,
+                name='command_watcher', args=(sys.stdin,))
+        self.watcher_thread.start()
+        logging.debug('end of __init__()')
+
+
     def start(self):
         while True:
-            if self.status in ['go']:
-                bestmove = self.engines[self.head].bestmove
+            #if self.status in ['go']:
+            if self.head is not None:
+                # print the output of the head engine
+                #bestmove = self.engines[self.head].bestmove
+                bestmove = None
+                while True:
+                    head_engine = self.engines[self.head]
+                    try:
+                        line = head_engine.queue.get_nowait()
+                        if line:
+                            if line.startswith('bestmove'):
+                                bestmove = line.split()[1]
+                                if 'ponder' in line:
+                                    ponder = line.split()[3]
+                            print(line, flush=True)
+                    except queue.Empty:
+                        break
+
                 if bestmove:
-                    print(f'bestmove {bestmove}', flush=True)
                     if not 'moves' in self.position:
                         self.position += ' moves'
                     self.position += f' {bestmove}'
-                    self.ponder(self.go_command)
+
+                    if bestmove == 'resign':
+                        for e in self.engines:
+                            e.stop()
 
             # check command from stdin
-            #while sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-            while [] != select.select([sys.stdin], [], [], 0)[0]:
-                command = sys.stdin.readline().strip()
-                print(f'info commandreceived: {command}', flush = True)
-                logging.debug(f'command got: {command}')
+            try:
+                command = self.queue.get_nowait()
+                print(f'info string command received: {command}', flush=True)
+
                 if command.startswith('position'):
-                    self.position = line[len('position'):].strip()
+                    print('info string setting position')
+                    self.position = command[len('position'):].strip()
                     logging.debug(f'position: {self.position}')
+                    print(f'info string position set: {self.position}', flush=True)
 
                 elif command.startswith('go'):
                     logging.debug('go found')
+                    print('info string processing go command', flush=True)
                     self.go(command)
 
                 elif command == 'usi':
@@ -168,23 +230,52 @@ class Chotgun:
                     self.wait_for_all('readyok')
                     print('readyok', flush=True)
 
-                #elif command.startswith('usinewgame') or command.startswith('setoption'):
-                elif False:
+                elif command.split()[0] in ['usinewgame', 'setoption']:
                     logging.debug(f'{command} command')
-                    print(f'info sending command: {command}', flush=True)
+                    print(f'info string sending command: {command}', flush=True)
                     self.send_all(command)
-                    print(f'info sent command: {command}', flush=True)
-                    time.sleep(0.5)
+                    print(f'info string sent command: {command}', flush=True)
+
+                elif command.split()[0] in ['gameover']:
+                    logging.debug(f'{command} command')
+                    print(f'info string sending command: {command}', flush=True)
+                    self.send_all(command)
+                    print(f'info string sent command: {command}', flush=True)
+                    for e in self.engines:
+                        if e.status in ['ponder', 'go']:
+                            e.wait_for_bestmove()
+                        e.status = 'wait'
+                    self.status = 'wait'
+
+                elif command == 'ponderhit':
+                    self.ponderhit()
+
+                elif command == 'stop':
+                    if self.head is not None:
+                        self.engines[self.head].send('stop')
 
                 elif command == 'quit':
-                    #engine.terminate()
-                    for e in self.engines:
-                        e.terminate()
-                    return
-            else:
+                    self.quit()
+
+                else:
+                    logging.debug(f'unrecognized command: {command}')
+                    print(f'info string unrecognized command: {command}')
+            #else:
+            except queue.Empty:
                 logging.debug('no command yet')
 
             time.sleep(0.1)
+
+    def command_watcher(self, stream):
+        logging.debug(f'starting command watcher thread')
+        #for line in iter(stream.readline, b''):
+        #while (not self.quit_event.isSet()) and (not stream.closed):
+        while not self.quit_event.isSet():
+            line = stream.readline().strip()
+            logging.debug(f'command queueing: {line}')
+            if len(line):
+                self.queue.put(line)
+        logging.debug(f'{self.name}: terminating the engine watcher thread')
 
     def send_all(self, command):
         for e in self.engines:
@@ -197,60 +288,125 @@ class Chotgun:
 
     def go(self, command):
         logging.debug('in go_cmd()')
+        print('info string in go()', flush=True)
+        if command.startswith('go ponder'):
+            #infostr(f'ignoring go ponder: {command}')
+            self.ponder_cmd(command)
+            return
         self.status = 'go'
         self.go_command = command
-        self.head = None
+        #self.head = None
+        #infostr(f'self.head: {self.head}')
         # is there any instance pondering the position?
         for i, e in enumerate(self.engines):
             if e.status in ['go', 'ponder']:
                 if e.position == self.position:
+                    print(f'info string ponder hit: {e.position}', flush=True)
+                    #e.clear_queue()
                     if e.status == 'ponder':
+                        e.status = 'go'
                         e.send('ponderhit')
                     self.head = i
+                    infostr(f'self.head: {self.head}')
                     return
 
         # no engine pondering the position
-        logging.debug('no pondering node found')
-        self.head = 1
-        e = self.engines[self.head]
-        e.set_position(self.position)
-        e.send(command)
-        e.bestmove = None
-        e.status = 'go'
+        logging.debug('no ponder hit')
+        print('info string no ponder hit', flush=True)
+        self.head = 0
+        infostr(f'self.head: {self.head}')
+        for i, e in enumerate(self.engines):
+            #e = self.engines[self.head]
+            e = self.engines[i]
+            if e.status in ['go', 'ponder']:
+                e.send('stop')
+                e.wait_for_bestmove()
+            e.set_position(self.position)
+            e.bestmove = None
+            if i == self.head:
+                e.send(command)
+                e.status = 'go'
+            else:
+                e.send(command.replace('go', 'go ponder'))
+                e.status = 'ponder'
+        infostr('end of go()')
 
-    def ponder(self, command):
-        logging.debug('in ponder()')
+    def ponder_cmd(self, command):
+        logging.debug('in ponder_cmd()')
+        print('info string in ponder_cmd()', flush=True)
         self.status = 'ponder'
+
+        # ponder the move sent by GUI
+        self.head = 0
+        self.engines[0].stop()
+        self.engines[0].set_position(self.position)
+        self.engines[0].ponder(command)
+        pos, _, head_ponder = self.position.rpartition(' ')
+        infostr(f'pos: {pos}, _: {_}, head_ponder: {head_ponder}')
+
         # find candidate moves
-        e = self.engines[0]
-        e.set_position(self.position)
+        e = self.engines[1]
+        e.stop()
+        e.set_position(pos)
         e.set_option('MultiPV', self.n_jobs)
         e.pvs = [None] * self.n_jobs
-        e.send('go depth 6')
+        e.send('go')
         e.wait_for_bestmove()
+        e.set_option('MultiPV', 1)
 
         # ponder the moves
         max_value = -99999
+        ie = 1
         for i in range(self.n_jobs):
+            if ie >= self.n_jobs:
+                break
+            print(f'i: {i}, ie: {ie}', flush=True)
+            print(f'head: {self.head}, head\'s status: {self.engines[self.head].status}', flush=True)
+            print(f'pv{i}: {e.pvs[i]}', flush=True)
+
             logging.debug(f'pv{i}: {e.pvs[i]}')
             if not e.pvs[i]:
                 break
-            self.engines[i].set_option('MultiPV', 1)
-            self.engines[i].set_position(f'{self.position} {e.pvs[i][1].split()[0]}')
-            if command:
-                if 'ponder' not in command:
-                    command = command.replace('go', 'go ponder')
-            else:
-                command = 'go ponder'
-            self.engines[i].send(command)
-            self.engines[i].status = 'ponder'
+            move = e.pvs[i][1].split()[0]
+            if move == head_ponder:
+                continue
+            self.engines[ie].stop()
+            position = f'{pos} {move}'
+            self.engines[ie].set_position(position)
+            self.engines[ie].ponder(command)
+            ie += 1
+        print('info string end of ponder_cmd()', flush=True)
+
+    def ponderhit(self):
+        infostr('in ponderhit()')
+        self.head = 0
+        e = self.engines[0]
+        e.status = 'go'
+        self.status = 'go'
+        e.send('ponderhit')
+
+
+    def quit(self):
+        #engine.terminate()
+        for e in self.engines:
+            e.terminate()
+        self.quit_event.set()
+        self.watcher_thread.join(1)
+        #return
+        sys.exit()
+
+    def __del__(self):
+        self.quit()
+
+def infostr(s):
+    print(f'info string {s}', flush=True)
 
 
 def main():
-    chotgun = Chotgun(5)
+    chotgun = Chotgun(n_jobs=5)
     chotgun.start()
-    exit(0)
+    sys.exit()
 
 if __name__ == "__main__":
     main()
-    exit(0)
+    sys.exit()
