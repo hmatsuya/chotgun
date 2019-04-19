@@ -10,6 +10,7 @@ import re
 import time
 import select
 import fcntl
+import os
 
 class USIEngine:
     def __init__(self, name, host, engine_path,
@@ -80,13 +81,13 @@ class USIEngine:
         self.send(f'setoption name {name} value {value}')
 
     def __del__(self):
-        self.terminate()
+        pass
+        #self.terminate()
 
     def terminate(self):
-        if self.status in ['go', 'ponder']:
-            self.send('stop')
-            self.wait_for_bestmove()
+        self.stop()
         self.quit_event.set()
+        self.send('usi')
         self.watcher_thread.join(1)
         self.send('quit')
         self.status = 'quit'
@@ -264,7 +265,7 @@ class Chotgun:
             except queue.Empty:
                 logging.debug('no command yet')
 
-            time.sleep(0.1)
+            time.sleep(0.05)
 
     def command_watcher(self, stream):
         logging.debug(f'starting command watcher thread')
@@ -275,7 +276,7 @@ class Chotgun:
             logging.debug(f'command queueing: {line}')
             if len(line):
                 self.queue.put(line)
-        logging.debug(f'{self.name}: terminating the engine watcher thread')
+        logging.debug(f'terminating the command watcher thread')
 
     def send_all(self, command):
         for e in self.engines:
@@ -393,10 +394,12 @@ class Chotgun:
         self.quit_event.set()
         self.watcher_thread.join(1)
         #return
-        sys.exit()
+        #sys.exit()
+        os._exit(1)
 
     def __del__(self):
-        self.quit()
+        pass
+        #self.quit()
 
 def infostr(s):
     print(f'info string {s}', flush=True)
