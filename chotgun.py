@@ -8,8 +8,6 @@ import copy
 from paramiko.client import SSHClient
 import re
 import time
-import select
-import fcntl
 import os
 
 class USIEngine:
