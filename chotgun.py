@@ -159,8 +159,16 @@ class Chotgun:
         self.engines = []
         self.position = 'startpos'
         self.go_command = None
-        for i in range(n_jobs):
-            self.engines.append(USIEngine(f'yane{i}', 'localhost', engine_path, multiPV=1))
+        #for i in range(n_jobs):
+            #self.engines.append(USIEngine(f'yane{i}', 'localhost', engine_path, multiPV=1))
+        with open('hosts.txt') as f:
+            i = 0
+            for host in f:
+                host = host.strip()
+                if host:
+                    self.engines.append(USIEngine(f'yane{i}', host, engine_path, multiPV=1))
+                    i += 1
+                    self.n_jobs = i
 
         # setup command watcher thread
         logging.debug('setting up command watcher')
