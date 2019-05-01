@@ -325,6 +325,7 @@ class Chotgun:
             if i == self.head:
                 e.send(command)
                 e.status = 'go'
+                break
             else:
                 e.send(command.replace('go', 'go ponder'))
                 e.status = 'ponder'
