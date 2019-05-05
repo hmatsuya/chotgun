@@ -6,6 +6,7 @@ import logging
 import random
 import copy
 from paramiko.client import SSHClient
+import paramiko
 import re
 import time
 import os
@@ -20,7 +21,10 @@ class USIEngine:
         self.quit_event = threading.Event()
 
         self.client = SSHClient()
-        self.client.load_system_host_keys()
+        self.client.set_missing_host_key_policy(paramiko.client.WarningPolicy)
+        #self.client.load_system_host_keys()
+        keys = self.client.get_host_keys()
+        keys.clear()
         self.client.connect(host)
         dirname = os.path.dirname(engine_path)
         command = f'cd {dirname} && {engine_path}'
@@ -44,8 +48,8 @@ class USIEngine:
         self.set_option('MultiPV', multiPV)
         if nodes:
             self.set_option('NodesLimit', nodes)
-        self.send('isready')
-        self.wait_for('readyok')
+        #self.send('isready')
+        #self.wait_for('readyok')
 
     def stream_watcher(self, stream):
         # for line in iter(stream.readline, b''):
@@ -151,8 +155,10 @@ class USIEngine:
 
 class Chotgun:
     def __init__(self, n_jobs=5):
-        logging.basicConfig(level=logging.DEBUG)
+        #logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(level=logging.INFO)
         engine_path = '/home/hmatsuya/workspace/Shogi/test/yane1/exe/YaneuraOu-by-gcc'
+        engine_path = '/home/hmatsuya/cobra/exe/YaneuraOu-by-gcc'
         self.n_jobs = n_jobs
         self.head = None
         self.status = 'wait'
@@ -161,7 +167,7 @@ class Chotgun:
         self.go_command = None
         #for i in range(n_jobs):
             #self.engines.append(USIEngine(f'yane{i}', 'localhost', engine_path, multiPV=1))
-        with open('hosts.txt') as f:
+        with open(os.path.join(os.path.dirname(sys.argv[0]), 'hosts.txt')) as f:
             i = 0
             for host in f:
                 host = host.strip()
@@ -271,7 +277,7 @@ class Chotgun:
             except queue.Empty:
                 logging.debug('no command yet')
 
-            time.sleep(0.05)
+            time.sleep(0.001)
 
     def command_watcher(self, stream):
         logging.debug(f'starting command watcher thread')
